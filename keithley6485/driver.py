@@ -261,9 +261,18 @@ class K6485Driver:
                 "pyvisa not installed. Run: pip install pyvisa pyvisa-py"
             ) from e
 
+        # Accept a bare Linux serial path (e.g. "/dev/ttyUSB0") and translate
+        # to the equivalent ASRL VISA resource string. Saves operators from
+        # having to remember the "ASRL...::INSTR" wrapper for a port they
+        # already know by path. Windows COM ports (COM5 etc.) are also
+        # accepted bare by pyvisa-py.
+        resource = self._visa_str
+        if resource.startswith("/dev/"):
+            resource = f"ASRL{resource}::INSTR"
+
         self._rm   = pyvisa.ResourceManager()
         self._inst = self._rm.open_resource(
-            self._visa_str,
+            resource,
             read_termination  = self._read_termination,
             write_termination = self._write_termination,
         )
