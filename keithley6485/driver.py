@@ -24,6 +24,8 @@ import numpy as np
 DEFAULT_VISA      = "ASRL6::INSTR"     # adjust COM port as needed
 TIMEOUT_MS        = 10_000
 BAUD_RATE         = 57600
+READ_TERMINATION  = "\r\n"
+WRITE_TERMINATION = "\n"
 IDN_EXPECTED      = "KEITHLEY INSTRUMENTS INC.,MODEL 6485"
 
 # Current ranges (A) — 6485 has 8 ranges
@@ -48,14 +50,20 @@ class K6485Driver:
         "hardware" or "simulation".
     """
 
-    def __init__(self, visa: str = DEFAULT_VISA, mode: str = "simulation"):
+    def __init__(self, visa: str = DEFAULT_VISA, mode: str = "simulation",
+                 baud_rate: int = BAUD_RATE,
+                 read_termination:  str = READ_TERMINATION,
+                 write_termination: str = WRITE_TERMINATION):
         if mode not in ("hardware", "simulation"):
             raise ValueError(f"mode must be 'hardware' or 'simulation', got {mode!r}")
-        self._visa_str  = visa
-        self._mode      = mode
-        self._inst      = None
-        self._rm        = None
-        self._connected = False
+        self._visa_str          = visa
+        self._mode              = mode
+        self._baud_rate         = baud_rate
+        self._read_termination  = read_termination
+        self._write_termination = write_termination
+        self._inst              = None
+        self._rm                = None
+        self._connected         = False
 
         # Simulation state
         self._sim_illuminated = False
@@ -256,11 +264,11 @@ class K6485Driver:
         self._rm   = pyvisa.ResourceManager()
         self._inst = self._rm.open_resource(
             self._visa_str,
-            read_termination="\r\n",
-            write_termination="\n",
+            read_termination  = self._read_termination,
+            write_termination = self._write_termination,
         )
         self._inst.timeout    = TIMEOUT_MS
-        self._inst.baud_rate  = BAUD_RATE   # serial only; ignored for GPIB
+        self._inst.baud_rate  = self._baud_rate   # serial only; ignored for GPIB
 
         idn = self._inst.query("*IDN?").strip()
         if IDN_EXPECTED not in idn:
