@@ -65,42 +65,90 @@ The default floor is the specification's typical RMS noise, scaled as
    - On the ETS machine, the program also asks the DAQ web app. It refuses while
      the web app has the K6485 connected, claimed or in use.
    - Disconnect it there first ("release all instruments").
-3. **GUI:** `k6485-campbell-gui`.
+3. **Connect:** `k6485-campbell-gui` (on the ETS machine:
+   `python scripts/k6485_campbell.py gui`).
    - Pick the port under `/dev/serial/by-id/` and connect. The settings as
      found are read back and shown.
-   - Choose the range, NPLC (an integer) and autozero, plus N readings.
-   - Fill in the operator notes: laser, ND, photodiode, bias, box state.
-   - Press start. When the run ends, the program restores the meter's settings
-     and saves the file.
    - To serve the GUI on the lab network, add `--host 0.0.0.0`.
+4. **Set the light level: "check level".**
+   - It takes 100 readings with zero check off and saves nothing.
+   - It shows the current, its sd against the nominal shot sd, and the
+     fraction of the range used.
+   - It warns on overflow and says when a lower range would fit.
+   - Keep the photocurrent in the top half to two-thirds of the range.
+   - On the 2 nA range, a laser that's on without ND overflows.
+5. **Take a run.**
+   - Choose the range, NPLC (an integer) and autozero, plus N readings.
+   - Fill in the notes: run kind, ND, laser, photodiode, bias, box state; the
+     resistor value for control or Johnson runs.
+   - Press start. When the run ends, the program restores the meter's settings
+     and saves one file.
+   - **NPLC sequence:** enter `1,2,5,10` to take one run per NPLC.
+   - **Zero-check floor after each:** adds a zero-check floor run after every
+     setting.
+   - **Run kinds:**
+     - photocurrent: laser on;
+     - dark: beam blocked;
+     - resistor control: battery + resistor at the same current;
+     - johnson: resistor at 0 V.
 
-   **CLI:**
-   ```bash
-   k6485-campbell run --port /dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0 \
-       --range 20n --nplc 1 --no-autozero --n 20000 --name pd_nd2 \
-       --note-laser "..." --note-nd "ND 2" --note-photodiode "..." --note-bias "0 V" --note-box "closed"
-   ```
-   Ctrl-C stops after the current burst's data are read back. The partial run
-   is still restored and saved.
-4. **The runs Will needs at each range and NPLC:**
-   - a floor with zero check on (`--zero-check`, or input "floor" in the GUI);
-   - a floor with the beam blocked;
-   - photocurrent at six or more ND settings;
-   - the battery and resistor control at the same currents.
+     Zero-check runs are marked by themselves.
+6. **Fit.** "fit runs" analyses the runs saved since connecting. From saved
+   files: `k6485-campbell fit data/campbell_k6485/*.h5 [--estimator naive|sdiff|band]`.
+   - **Series fit:** for each range and NPLC, fit
+     `T_int*V = a + e<I> + b<I>^2` over the photocurrent runs. Here a is the
+     floor, the slope is e, and b is the laser's classical noise. The b term
+     is fitted with 4 or more runs; the brief asks for 6 or more currents.
+   - **Resistor control:** each photocurrent run is paired with a control run
+     at the same range, NPLC and current (within 10 %):
+     `e = T_int (V_pd - V_ctl + 2kT/(R T_int)) / <I>`.
+   - **Johnson runs:** fit `V = c + d/R (+ f/R^2)` and get
+     `T_eff = 2 k T_R / d`, which needs no e. Put the resistance in the
+     resistor note.
+   - **NPLC table:** `T_int*V/<I>` per run. For shot noise it is the same at
+     every NPLC.
 
-   `floor_subtracted_charge(light, dark)` in `keithley6485.campbell.stats`
-   combines a light run with a dark run.
-5. **Check the statistics.** Lag-1 autocorrelation should be near 0, the
-   spectrum flat, and Allan m·σ² flat. `T_int*Var/<I>`,
-   `T_int*sdiff/<I>` and `T_int*P_band/<I>` should agree. If they don't, the
-   readings are correlated, and `e / (T_int*Var/<I>)` measures T_eff/T_int.
+**CLI equivalents:**
+```bash
+P=/dev/serial/by-id/usb-Prolific_Technology_Inc._USB-Serial_Controller_D-if00-port0
+k6485-campbell check --port $P --range 2n --nplc 1
+k6485-campbell run --port $P --range 2n --nplc 1 2 5 10 --zc-floor --n 20000 --name pd_nd1 \
+    --kind photocurrent --note-nd "ND 1" --note-laser "..." --note-photodiode "..." --note-bias "0 V" --note-box "closed"
+k6485-campbell run --port $P --range 2n --nplc 1 --n 20000 --name ctl_1G --kind "resistor control" \
+    --note-resistor_ohm 1.5e9 --note-battery_v 1.5
+k6485-campbell fit data/campbell_k6485/*.h5 --estimator sdiff
+```
+Ctrl-C stops after the current burst's data are read back. The partial run is
+still restored and saved.
 
-**Timing at 9600 baud.** A 2500-reading burst is about 105 kB of ASCII
-(reading, time and status, 42 characters each), so it takes about 110 s to
-transfer. At 1 PLC the burst itself takes about 45 s. The time stamps make the
-gaps between bursts visible. The variance does not care about them, and the
-spectra are taken inside bursts. At 57.6 kbaud the transfer would take about
-18 s.
+**Check the statistics.**
+- Lag-1 autocorrelation should be near 0, and the spectrum and Allan m·σ²
+  should be flat.
+- `T_int*Var/<I>`, `T_int*sdiff/<I>` and `T_int*P_band/<I>` should agree. If
+  they don't, the readings are correlated.
+- With pure shot noise, `e / (T_int*Var/<I>)` is T_eff/T_int.
+
+**What the meter showed (2026-11-25, S/N 4456711).**
+- **Zero-check floor:** about 35 fA at 0.1 PLC, 4.5-5 fA at 1 PLC and
+  3 fA at 5 PLC on the 2 nA and 20 nA ranges. It is 0.3-0.5 pA on 200 nA.
+- **At 1 and 5 PLC** the floor is dominated by slow drift: lag-1 is
+  +0.2 to +0.56, and the spectrum falls 6-20x by 10 Hz. Subtract floors with
+  the sdiff or band estimate.
+- **At 0.1 PLC** it is anti-correlated, with lag-1 -0.22, from line harmonics.
+- **Readings are quantized** in steps of 3.55 fA on 2 nA and 20 nA, and
+  0.23 pA on 200 nA.
+- **The photodiode dark at 0.1 PLC** (laser off, zero check off) was
+  19 pA ± 6.7 pA.
+
+**Timing at 9600 baud** (measured).
+- Transfer takes 54-55 ms per reading, so a 2500-reading burst is about 137 s.
+- Acquisition at 1 PLC with autozero off runs at 58.8 readings/s, about 43 s
+  per burst (T_int/dt = 0.98).
+- At 0.1 PLC it is 498 readings/s; at 5 PLC, 11.95 readings/s.
+- So 20 000 readings at 1 PLC take about 24 min.
+- The gaps between bursts are timed on the instrument clock. The variance does
+  not care about them, and the spectra are taken inside bursts.
+- At 57.6 kbaud the transfer would take about 23 s per burst (Lucas's call).
 
 ### Output file
 
@@ -139,13 +187,17 @@ Rev. A:
 
 `keithley6485/campbell/meter.py` lists them with page numbers.
 
-**Not yet confirmed on the instrument:**
-- the exact ASCII field format;
-- whether `SENS:DATA?` carries the absolute timer, which would give the gaps
-  between bursts on the instrument clock (the host clock is the fallback);
-- whether NPLC above 6 is accepted over SCPI. The SCPI tables say 6, the
-  front-panel menu says 60;
-- the query reply formats.
+**Confirmed on the instrument** (2026-11-25):
+- `TRAC:DATA?` sends `+1.776357E-13,+0.000000E+00,+5.120000E+02,...`;
+- `SENS:DATA?` carries the absolute timer, so the gaps between bursts are on
+  the instrument clock;
+- `*OPC?` after INIT works;
+- every snapshot query is answered;
+- the range reads back 5 % over nominal;
+- restore leaves the meter as found.
+
+**Still open:** whether NPLC above 6 is accepted over SCPI. The SCPI tables say
+6, the front-panel menu says 60.
 
 The driver raises an error on any error-queue entry or readback mismatch, so a
 wrong guess fails loudly instead of corrupting data.
@@ -161,7 +213,9 @@ These are simulation only and never touch hardware. They check:
 - that the AR(1) and boxcar filters move the plain variance but not a
   low-band periodogram;
 - the settings readback and restore, the error queue, chained and aborted
-  bursts, the parser, the HDF5 round trip, the port guard and the CLI.
+  bursts, the parser, the HDF5 round trip, the port guard and the CLI;
+- the series fit (e, floor and laser terms), the resistor control, Johnson
+  T_eff, the quick check and NPLC sequences.
 
 ## Original driver (used by the ETS DAQ)
 

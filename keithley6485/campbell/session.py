@@ -17,14 +17,16 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from . import guard
-from .meter import CampbellMeter, MeterError, RunData
+from .meter import RANGES_A, CampbellMeter, MeterError, RunData
 from .sim import SimPhysics, SimulatedK6485
-from .stats import campbell_stats
+from .stats import E_CHARGE, campbell_stats
 from .store import DEFAULT_DIR, default_path, write_run
 from .transport import SerialTransport, SimTransport
 
 SIM_PORT = "simulation"
-NOTE_FIELDS = ("operator", "laser", "nd", "photodiode", "bias", "box", "text")
+NOTE_FIELDS = ("operator", "kind", "laser", "nd", "photodiode", "bias", "box",
+               "resistor_ohm", "battery_v", "temperature_k", "text")
+RUN_KINDS = ("photocurrent", "dark", "zero-check floor", "resistor control", "johnson")
 
 
 @dataclass
@@ -76,6 +78,12 @@ class Session:
         self.last_path: Optional[Path] = None
         self.saved_version = -1
         self.notes = {k: "" for k in NOTE_FIELDS}
+        self.notes["kind"] = "photocurrent"
+        self.run_notes: dict = {}
+        self.history: list[dict] = []
+        self.sequence: list = []
+        self.seq_index = 0
+        self.last_check: Optional[dict] = None
         self.phase = "disconnected"
         self.progress = {"burst": 0, "n_bursts": 0, "phase": "", "frac": 0.0}
         self.version = 0
@@ -119,28 +127,49 @@ class Session:
                     raise RuntimeError("refusing to open the port: " + "; ".join(problems))
                 transport = SerialTransport(conn.port, conn.baud, conn.read_term, conn.write_term,
                                             xonxoff=conn.xonxoff)
-            meter = CampbellMeter(transport)
-            try:
-                idn = meter.connect()
-                self.log(f"connected: {idn} ({transport.describe()})")
-                if meter.found_errors:
-                    self.log(f"error queue at connect (cleared): {meter.found_errors}")
-                t0 = time.monotonic()
-                self.found = meter.settings_snapshot()
-                self.log(f"settings as found read back in {time.monotonic() - t0:.1f} s"
-                         + (f"; refused: {self.found['_refused']}" if self.found["_refused"] else ""))
-            except Exception:
-                transport.close()
-                raise
-            self.meter = meter
-            self.conn = conn
-            self.restored = True
-            self.phase = "idle"
-            return idn
+            return self._open(transport, conn)
         except Exception:
             self.phase = "disconnected"
             self.simulator = None
             raise
+
+    def attach(self, transport, label: str = "external", baud: int = 9600) -> str:
+        """Use a transport someone else owns (e.g. the ETS DAQ hub's open resource).
+
+        No port guard: the owner has the port. ``transport`` needs ``write(cmd)``,
+        ``readline(timeout, abort=None, on_bytes=None)``, ``flush_input()`` and
+        ``close()`` (make it a no-op to keep the resource open); ``baud`` and
+        ``describe()`` are optional.
+        """
+        if self.connected:
+            raise RuntimeError("already connected")
+        self.phase = "connecting"
+        try:
+            return self._open(transport, Connection(port=label, baud=int(getattr(transport, "baud", baud))))
+        except Exception:
+            self.phase = "disconnected"
+            raise
+
+    def _open(self, transport, conn: Connection) -> str:
+        meter = CampbellMeter(transport)
+        try:
+            idn = meter.connect()
+            desc = transport.describe() if hasattr(transport, "describe") else conn.port
+            self.log(f"connected: {idn} ({desc})")
+            if meter.found_errors:
+                self.log(f"error queue at connect (cleared): {meter.found_errors}")
+            t0 = time.monotonic()
+            self.found = meter.settings_snapshot()
+            self.log(f"settings as found read back in {time.monotonic() - t0:.1f} s"
+                     + (f"; refused: {self.found['_refused']}" if self.found["_refused"] else ""))
+        except Exception:
+            transport.close()
+            raise
+        self.meter = meter
+        self.conn = conn
+        self.restored = True
+        self.phase = "idle"
+        return idn
 
     def disconnect(self, restore: bool = True) -> None:
         if self.running:
@@ -168,15 +197,54 @@ class Session:
         self.restored = not diff
         self.log("meter settings restored as found" if not diff else f"restore left differences: {diff}")
 
+    # ------------------------------------------------------------------ quick check
+    def check(self, range_a: float, nplc: float, autozero: bool = False, n: int = 100,
+              settle_s: float = 1.0) -> dict:
+        """One short burst with zero check off: the current level, the noise and range advice.
+
+        Saves nothing. The settings are restored on disconnect (or after the next run).
+        """
+        if not self.connected:
+            raise RuntimeError("not connected")
+        if self.running:
+            raise RuntimeError("a run is in progress")
+        m = self.meter
+        self.restored = False
+        cfg = m.configure_campbell(range_a, nplc, autozero, display_off=True, zero_check=False)
+        time.sleep(settle_s)
+        b = m.acquire_burst(int(n), read_abs_time=False)
+        st = campbell_stats(b.i_a, b.t_s, cfg["nplc"], cfg["line_freq_hz"], status=b.status)
+        res = {"range_a": range_a, "nplc": nplc, "n": b.n, "n_overflow": st["n_overflow"],
+               "mean_a": st.get("mean_a", float("nan")), "sd_a": st.get("sd_a", float("nan")),
+               "shot_sd_a": st.get("shot_sd_nominal_a", float("nan"))}
+        res["advice"] = range_advice(range_a, res["mean_a"], res["sd_a"], st["n_overflow"], b.n)
+        self.last_check = res
+        self.log("check: " + res["advice"])
+        return res
+
     # ------------------------------------------------------------------ runs
     def start(self, rs: RunSettings) -> None:
+        self.start_sequence([rs])
+
+    def start_sequence(self, seq: list) -> None:
+        """Run the settings one after the other (one file each); restore after the last."""
         if not self.connected:
             raise RuntimeError("not connected")
         if self.running:
             raise RuntimeError("a run is already in progress")
+        if not seq:
+            raise ValueError("empty sequence")
         self._stop.clear()
+        self.sequence = [dataclasses.replace(r) for r in seq]
+        self.seq_index = 0
+        self._reset_run(self.sequence[0])
+        self._thread = threading.Thread(target=self._run_sequence, args=(self.sequence,), daemon=True,
+                                        name="k6485-campbell-run")
+        self._thread.start()
+
+    def _reset_run(self, rs: RunSettings) -> None:
         with self.lock:
-            self.request = dataclasses.replace(rs)
+            self.request = rs
             self.run = None
             self.stats = None
             self.throughput = {}
@@ -185,10 +253,10 @@ class Session:
             self.restore_diff = None
             self.last_path = None
             self.progress = {"burst": 0, "n_bursts": 0, "phase": "", "frac": 0.0}
+            self.run_notes = dict(self.notes)
+            if rs.zero_check:
+                self.run_notes["kind"] = "zero-check floor"
             self.version += 1
-        self._thread = threading.Thread(target=self._run, args=(self.request,), daemon=True,
-                                        name="k6485-campbell-run")
-        self._thread.start()
 
     def stop(self) -> None:
         if self.running:
@@ -233,7 +301,23 @@ class Session:
             self._update_stats()
             self.version += 1
 
-    def _run(self, rs: RunSettings) -> None:
+    def _run_sequence(self, seq: list) -> None:
+        try:
+            for i, rs in enumerate(seq):
+                if self._stop.is_set():
+                    break
+                self.seq_index = i
+                if i:
+                    self._reset_run(rs)
+                if len(seq) > 1:
+                    self.log(f"sequence run {i + 1}/{len(seq)}: {rs.name}")
+                self._run_one(rs, last=(i == len(seq) - 1) or self._stop.is_set())
+        finally:
+            if not self.restored and seq[-1].restore_after and self.found and self.meter is not None:
+                self._restore()
+            self.phase = "idle"
+
+    def _run_one(self, rs: RunSettings, last: bool) -> None:
         m = self.meter
         try:
             self.phase = "configuring"
@@ -258,8 +342,9 @@ class Session:
             if not isinstance(e, (MeterError, ValueError)):
                 self.log(traceback.format_exc().strip().splitlines()[-1])
         finally:
-            self.phase = "restoring"
-            if rs.restore_after and self.found:
+            last = last or self._stop.is_set()
+            if last and rs.restore_after and self.found:
+                self.phase = "restoring"
                 self._restore()
             with self.lock:
                 self._update_stats()
@@ -270,7 +355,6 @@ class Session:
                     self.log(f"saved {p}")
                 except Exception as e:
                     self.log(f"save FAILED: {type(e).__name__}: {e}")
-            self.phase = "idle"
             self.log("run finished" + (f" with {self.run.n} readings" if self.run else " with no data"))
 
     # ------------------------------------------------------------------ saving
@@ -294,12 +378,65 @@ class Session:
                     {k: [str(x) for x in v] if isinstance(v, (tuple, list)) else str(v)
                      for k, v in self.restore_diff.items()})
             req = dataclasses.asdict(rs)
+            notes = dict(self.run_notes or self.notes)
             p = write_run(path, i_a=self.run.i_a, t_s=self.run.t_s, status=self.run.status,
                           burst=self.run.burst, bursts=self.run.burst_table(),
                           settings=self.settings_used, found=self.found, request=req,
-                          stats=self.stats, notes=dict(self.notes),
+                          stats=self.stats, notes=notes,
                           sim=self.simulator.physics_dict() if self.simulator else None,
                           extra=extra)
             self.last_path = p
             self.saved_version = self.version
+            st = self.stats or {}
+            row = {"run_id": p.stem, "path": str(p), "kind": notes.get("kind", ""), "nd": notes.get("nd", ""),
+                   "range_a": rs.range_a, "nplc": rs.nplc, "zero_check": rs.zero_check, "n": self.run.n,
+                   "mean_a": st.get("mean_a"), "sd_a": st.get("sd_a"), "acf1": (st.get("acf") or [None])[0]}
+            for k in ("naive", "sdiff", "band"):
+                row[f"e_{k}_over_e"] = st.get(f"e_{k}_over_e")
+            self.history = [h for h in self.history if h["path"] != str(p)] + [row]
             return p
+
+    def fit_history(self, est: str = "naive", band_hz=None) -> dict:
+        """Will's analyses over the runs saved in this connection."""
+        from . import analysis
+        paths = [h["path"] for h in self.history]
+        if not paths:
+            return {}
+        band = band_hz or ((self.request.band_lo_hz, self.request.band_hi_hz) if self.request else (1.0, 10.0))
+        runs = analysis.load_runs(paths, band_hz=band)
+        return {"fit": analysis.fit_charge(runs, est), "control": analysis.resistor_control(runs, est),
+                "johnson": analysis.johnson_teff(runs, est), "table": analysis.nplc_table(runs, est)}
+
+
+def build_sequence(rs: RunSettings, nplc_list=None, zc_floor: bool = False) -> list:
+    """One run per NPLC (names get _<nplc>plc), each optionally followed by a zero-check floor run."""
+    nplcs = [float(x) for x in (nplc_list or [rs.nplc])]
+    seq = []
+    for x in nplcs:
+        name = f"{rs.name}_{x:g}plc" if len(nplcs) > 1 else rs.name
+        run = dataclasses.replace(rs, nplc=x, name=name)
+        seq.append(run)
+        if zc_floor and not rs.zero_check:
+            seq.append(dataclasses.replace(run, zero_check=True, name=name + "_zcfloor"))
+    return seq
+
+
+def range_advice(range_a: float, mean: float, sd: float, n_over: int, n: int) -> str:
+    """Will's brief: keep the photocurrent in the top half to two-thirds of the range, never overflowing."""
+    if n_over:
+        up = [r for r in RANGES_A if r > range_a]
+        return (f"{n_over}/{n} readings OVERFLOW on the {range_a:g} A range: "
+                + (f"use {up[0]:g} A or less light" if up else "less light"))
+    if not (mean == mean):
+        return "no valid readings"
+    fill = abs(mean) / range_a
+    fit = [r for r in RANGES_A if abs(mean) + 6 * sd < 1.05 * r]
+    best = fit[0] if fit else None
+    txt = f"<I> = {mean:.4g} A, sd {sd:.3g} A: {fill:.0%} of the {range_a:g} A range"
+    if 0.5 <= fill <= 0.67:
+        return txt + " (in the 50-67 % window)"
+    if best is not None and best < range_a:
+        return txt + f"; the {best:g} A range would be more sensitive"
+    if fill > 0.67:
+        return txt + "; above 2/3 of the range: overflow risk, less light or the next range"
+    return txt + "; below half the range: more light, or accept the lower fill"

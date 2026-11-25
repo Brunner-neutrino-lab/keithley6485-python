@@ -144,6 +144,9 @@ class SimPhysics:
     autozero_factor: float = 2.0
     jitter_s: float = 2e-6
     quantum_a: float = 0.0           # round readings to this step (0: exponent format only)
+    shot_noise: bool = True          # False: a noiseless DC current (battery + resistor control)
+    johnson_r_ohm: float = 0.0       # > 0: add the Johnson noise of this source resistance, 2kT/(R T) per reading
+    temperature_k: float = 295.0
     seed: Optional[int] = None
 
     def to_dict(self) -> dict:
@@ -558,7 +561,10 @@ class SimulatedK6485:
         if p.filter == "boxcar":
             x = self._boxcar(n_conv, T, i_dc, floor)
         else:
-            x = self._shot(n_conv, T, i_dc) + floor * rng.standard_normal(n_conv)
+            sig = self._shot(n_conv, T, i_dc) if p.shot_noise else np.full(n_conv, i_dc)
+            x = sig + floor * rng.standard_normal(n_conv)
+        if live and p.johnson_r_ohm > 0:
+            x = x + math.sqrt(2 * 1.380649e-23 * p.temperature_k / (p.johnson_r_ohm * T)) * rng.standard_normal(n_conv)
         if live and p.excess_rel_sd:
             x = x + abs(p.current_a) * p.excess_rel_sd * rng.standard_normal(n_conv)
         x = x + p.offset_a

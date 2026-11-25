@@ -18,7 +18,7 @@ import numpy as np
 from . import __version__
 from .guard import list_ports
 from .meter import BUFFER_MAX, RANGES_A
-from .session import NOTE_FIELDS, SIM_PORT, Connection, RunSettings, Session
+from .session import NOTE_FIELDS, RUN_KINDS, SIM_PORT, Connection, RunSettings, Session, build_sequence
 from .sim import SimPhysics
 from .stats import E_CHARGE, binned_spectrum, invalid_mask
 from .store import DEFAULT_DIR
@@ -31,7 +31,9 @@ _RANGE_LABELS = {f"{r / u:g} {n}": r for r in RANGES_A for n, u in _UNITS if 1 <
 _BAUDS = [300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600]
 _NOTE_LABELS = {"operator": "operator", "laser": "laser (model, drive, wavelength)", "nd": "ND filters",
                 "photodiode": "photodiode (type, area)", "bias": "photodiode bias", "box": "box / shielding state",
-                "text": "free text"}
+                "text": "free text", "kind": "what is on the input (run kind)",
+                "resistor_ohm": "resistor (ohm): control or Johnson runs", "battery_v": "battery (V): control runs",
+                "temperature_k": "resistor temperature (K), Johnson runs"}
 
 
 def unit_for(v: float) -> tuple[str, float]:
@@ -202,6 +204,9 @@ def index() -> None:
                 disp_sw = ui.switch("display off", value=True)
             input_sel = ui.select({"live": "input live (zero check off)", "floor": "floor: zero check ON"},
                                   label="input", value="live").classes("w-full")
+            nplc_list_in = ui.input("NPLC sequence (optional, e.g. 1,2,5,10)").classes("w-full").tooltip(
+                "one run per NPLC, one file each; overrides NPLC above")
+            zcfloor_sw = ui.checkbox("zero-check floor run after each", value=False)
             with ui.row().classes("gap-2"):
                 n_in = ui.number("readings N", value=20000, min=1, step=2500).classes("w-28 num")
                 burst_in = ui.number("per burst", value=BUFFER_MAX, min=1, max=BUFFER_MAX, step=100).classes(
@@ -219,6 +224,10 @@ def index() -> None:
                 start_btn = ui.button("start", color="positive")
                 stop_btn = ui.button("stop", color="warning")
                 recompute_btn = ui.button("recompute").props("outline").tooltip("statistics with the band above")
+            with ui.row().classes("gap-2 items-center"):
+                check_btn = ui.button("check level", color="primary").props("outline").tooltip(
+                    "100 readings with zero check off: the current, its noise and range advice; saves nothing")
+            check_lbl = ui.label("").classes("text-xs")
             progress = ui.linear_progress(value=0, show_value=False).classes("w-full")
             progress_lbl = ui.label("").classes("text-xs")
 
@@ -228,6 +237,12 @@ def index() -> None:
             for k in NOTE_FIELDS:
                 def _bind(e, key=k):
                     s.notes[key] = e.value or ""
+                if k == "kind":
+                    ui.select(list(RUN_KINDS), label=_NOTE_LABELS[k], value=s.notes.get(k) or "photocurrent",
+                              on_change=_bind).classes("w-full").tooltip(
+                        "photocurrent: laser on; dark: beam blocked; resistor control: battery + resistor; "
+                        "johnson: resistor at 0 V. Zero-check runs are marked by themselves.")
+                    continue
                 widget = ui.textarea if k == "text" else ui.input
                 widget(_NOTE_LABELS[k], value=s.notes.get(k, ""), on_change=_bind).classes("w-full")
             with ui.row().classes("gap-2 items-center w-full"):
@@ -252,6 +267,23 @@ def index() -> None:
         with ui.card().classes("w-1/3"):
             ui.label("log").classes("font-semibold")
             log = ui.log(max_lines=400).classes("w-full h-64 text-xs")
+
+    with ui.row().classes("w-full gap-3 no-wrap items-start"):
+        with ui.card().classes("grow"):
+            ui.label("runs saved since connecting").classes("font-semibold")
+            runs_table = ui.table(rows=[], columns=[
+                {"name": c, "label": lbl, "field": c, "align": "left"} for c, lbl in (
+                    ("run", "run"), ("kind", "kind"), ("nd", "ND"), ("range", "range"), ("nplc", "NPLC"),
+                    ("n", "N"), ("mean", "<I>"), ("sd", "sd"), ("naive", "T·Var/<I> (e)"),
+                    ("sdiff", "T·sdiff/<I> (e)"), ("band", "T·P_band/<I> (e)"), ("acf1", "lag 1"))],
+                row_key="run").props("dense flat").classes("w-full")
+        with ui.card().classes("w-1/3"):
+            ui.label("fit the saved runs (Will's analysis)").classes("font-semibold")
+            with ui.row().classes("gap-2 items-center"):
+                est_sel = ui.select({"naive": "Var", "sdiff": "successive diff.", "band": "band periodogram"},
+                                    label="variance estimate", value="naive").classes("w-40")
+                fit_btn = ui.button("fit runs", color="primary")
+            fit_out = ui.html("").classes("text-xs")
 
     # ---------------------------------------------------------------- actions
     def conn_from_ui() -> Connection:
@@ -303,11 +335,41 @@ def index() -> None:
             rs = run_settings()
             if not 1 <= rs.burst_size <= BUFFER_MAX:
                 raise ValueError(f"burst size must be 1..{BUFFER_MAX}")
-            if abs(rs.nplc - round(rs.nplc)) > 1e-9:
-                ui.notify("NPLC is not an integer: line ripple will not be rejected", type="warning")
-            s.start(rs)
+            txt = (nplc_list_in.value or "").replace(";", ",").strip()
+            nplcs = [float(x) for x in txt.split(",") if x.strip()] if txt else [rs.nplc]
+            if any(abs(x - round(x)) > 1e-9 for x in nplcs):
+                ui.notify("an NPLC is not an integer: line ripple will not be rejected", type="warning")
+            seq = build_sequence(rs, nplcs, zc_floor=bool(zcfloor_sw.value))
+            s.start_sequence(seq)
+            if len(seq) > 1:
+                ui.notify(f"sequence of {len(seq)} runs started")
         except Exception as e:
             ui.notify(f"cannot start: {e}", type="negative")
+
+    async def do_check():
+        try:
+            r = await run.io_bound(s.check, _RANGE_LABELS[range_sel.value], float(nplc_in.value),
+                                   bool(az_sw.value), 100)
+            check_lbl.text = r["advice"] + (f" · sd/shot {r['sd_a'] / r['shot_sd_a']:.2f}"
+                                           if r["shot_sd_a"] and r["shot_sd_a"] == r["shot_sd_a"]
+                                           and r["sd_a"] == r["sd_a"] else "")
+            ui.notify(r["advice"], type="warning" if r["n_overflow"] else "info", multi_line=True)
+        except Exception as e:
+            ui.notify(f"check failed: {e}", type="negative")
+
+    async def do_fit():
+        from .cli import fit_lines
+        try:
+            out = await run.io_bound(s.fit_history, est_sel.value,
+                                     (float(band_lo.value), float(band_hi.value)))
+            if not out:
+                fit_out.content = "no saved runs yet"
+                return
+            import html as _html
+            fit_out.content = "<pre style='white-space:pre-wrap'>" + _html.escape(
+                "\n".join(fit_lines(out, None, est_sel.value))) + "</pre>"
+        except Exception as e:
+            ui.notify(f"fit failed: {e}", type="negative")
 
     def do_save():
         try:
@@ -326,9 +388,11 @@ def index() -> None:
     stop_btn.on_click(s.stop)
     save_btn.on_click(do_save)
     recompute_btn.on_click(do_recompute)
+    check_btn.on_click(do_check)
+    fit_btn.on_click(do_fit)
 
     # ---------------------------------------------------------------- refresh
-    seen = {"version": -1, "log": 0, "found": None}
+    seen = {"version": -1, "log": 0, "found": None, "history": -1, "over_warned": None}
 
     def update_plots():
         with s.lock:
@@ -431,7 +495,14 @@ def index() -> None:
                                          else 0.5 + 0.5 * pr["frac"] if pr["phase"] == "transfer" else 1.0)) \
                 / pr["n_bursts"]
             progress.value = max(0.0, min(1.0, frac))
-            progress_lbl.text = f"burst {pr['burst']}/{pr['n_bursts']} · {pr['phase']} {pr['frac']:.0%}"
+            seq_txt = f"run {s.seq_index + 1}/{len(s.sequence)} · " if len(s.sequence) > 1 else ""
+            n_over = (s.stats or {}).get("n_overflow", 0)
+            progress_lbl.text = (seq_txt + f"burst {pr['burst']}/{pr['n_bursts']} · {pr['phase']} {pr['frac']:.0%}"
+                                 + (f" · {n_over} OVERFLOW" if n_over else ""))
+            if n_over and seen["over_warned"] != (s.seq_index, id(s.run)):
+                seen["over_warned"] = (s.seq_index, id(s.run))
+                ui.notify(f"{n_over} readings overflow: the current is above the range (less light or a higher "
+                          f"range)", type="warning", timeout=8000)
         elif s.running:
             progress_lbl.text = ph
         elif s.run is not None:
@@ -455,6 +526,19 @@ def index() -> None:
         for m in msgs[seen["log"]:]:
             log.push(m)
         seen["log"] = len(msgs)
+        if len(s.history) != seen["history"]:
+            seen["history"] = len(s.history)
+
+            def e3(v):
+                return "—" if v is None or not np.isfinite(v) else f"{v:.4f}"
+            runs_table.rows = [{"run": h["run_id"], "kind": h["kind"], "nd": h["nd"], "range": fmt_a(h["range_a"], 3),
+                                "nplc": f"{h['nplc']:g}", "n": h["n"], "mean": fmt_a(h["mean_a"]),
+                                "sd": fmt_a(h["sd_a"]),
+                                "naive": e3(h["e_naive_over_e"]) if h["kind"] == "photocurrent" else "—",
+                                "sdiff": e3(h["e_sdiff_over_e"]) if h["kind"] == "photocurrent" else "—",
+                                "band": e3(h["e_band_over_e"]) if h["kind"] == "photocurrent" else "—",
+                                "acf1": e3(h["acf1"])} for h in s.history]
+            runs_table.update()
         if s.version != seen["version"]:
             seen["version"] = s.version
             update_plots()
