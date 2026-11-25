@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keithley6485"
+version = "0.2.0"
+description = "Keithley 6485 picoammeter: SCPI driver, and a standalone Campbell (shot-noise) acquisition program with a GUI"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.21",
+    "pyserial>=3.4",
+    "h5py>=3.0",
+    "nicegui>=2.0",
+]
+
+[project.optional-dependencies]
+# the original K6485Driver (keithley6485.driver), which the ETS DAQ uses, talks through pyvisa
+visa = ["pyvisa", "pyvisa-py"]
+
+[project.scripts]
+k6485-campbell = "keithley6485.campbell.cli:main"
+k6485-campbell-gui = "keithley6485.campbell.gui:main"
+
+[tool.setuptools.packages.find]
+include = ["keithley6485*"]

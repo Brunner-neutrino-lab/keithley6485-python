@@ -2,3 +2,5 @@ numpy
 nicegui
 pyvisa
 pyvisa-py
+pyserial
+h5py
