@@ -117,6 +117,10 @@ class K6485Driver:
         self._inst              = None
         self._rm                = None
         self._connected         = False
+        # Set by a program that drives the resource itself for a while (the
+        # ETS DAQ's Campbell runs): every command through this driver is then
+        # refused, so nothing else interleaves on the serial line.
+        self._held_by: str | None = None
 
         # Simulation state
         self._sim_illuminated = False
@@ -153,11 +157,17 @@ class K6485Driver:
     # SCPI primitives
     # ------------------------------------------------------------------
 
+    def _check_free(self):
+        if self._held_by is not None:
+            raise RuntimeError(f"K6485 is in use: {self._held_by}")
+
     def write(self, cmd: str):
+        self._check_free()
         if self._mode == "hardware":
             self._inst.write(cmd)
 
     def query(self, cmd: str) -> str:
+        self._check_free()
         if self._mode == "hardware":
             return self._inst.query(cmd).strip()
         return ""
@@ -267,6 +277,7 @@ class K6485Driver:
         float
             Current in amperes.
         """
+        self._check_free()
         if self._mode == "hardware":
             raw = self.query("READ?")
             # Response format: "<value>A,<timestamp>,..."; take first field
@@ -285,6 +296,7 @@ class K6485Driver:
         timestamps : np.ndarray
             UTC timestamps for each reading (s).
         """
+        self._check_free()
         if self._mode == "hardware":
             return self._read_n_hardware(n, delay_s)
         else:
@@ -314,6 +326,7 @@ class K6485Driver:
         """
         if not 1 <= n <= BUFFER_MAX:
             raise ValueError(f"n must be in [1, {BUFFER_MAX}], got {n!r}")
+        self._check_free()
         if self._mode == "hardware":
             return self._read_buffer_hardware(n)
         else:
@@ -360,7 +373,9 @@ class K6485Driver:
     def _disconnect_hardware(self):
         if self._inst is not None:
             try:
-                self.zero_check_on()
+                # A holder may be mid-burst: leave the input as it is then.
+                if self._held_by is None:
+                    self.zero_check_on()
                 self._inst.close()
             except Exception:
                 pass
