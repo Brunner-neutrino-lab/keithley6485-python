@@ -153,6 +153,13 @@ def build_page(get_controller: Optional[Callable[[], Optional[K6485Driver]]] = N
                     set_pill("connecting…", "warn")
                     try:
                         await _in_thread(c.connect)
+                        # connect() sends no *RST; the panel works from the
+                        # factory defaults (finite trigger and arm counts).
+                        try:
+                            await _in_thread(c.reset)
+                        except Exception:
+                            await _in_thread(c.disconnect)
+                            raise
                         _own["ctrl"] = c
                         set_pill(f"OK — {visa_in.value.strip()}", "ok")
                         log_msg(f"connected ({mode_in.value} on {visa_in.value.strip()})")

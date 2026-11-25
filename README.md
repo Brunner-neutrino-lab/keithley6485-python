@@ -49,3 +49,12 @@ drv.sim_set_photocurrent(15e-9)  # set illuminated current level (A)
 - Interface: RS-232 (serial) or GPIB via pyvisa
 - Default baud: 57600, 8N1
 - Zero check must be OFF before measuring (`drv.zero_check_off()`)
+- `connect()` checks `*IDN?` and sends no `*RST`; call `reset()` for factory
+  defaults.
+- `read_buffer(n)` (n up to 2500) sets `FORM:ELEM READ,TIME,STAT`, arm count 1
+  and trigger count n, waits on `*OPC?`, reads `TRAC:DATA?` (three fields per
+  reading) and puts the trigger and arm counts and `FORM:ELEM` back as found:
+  `READ?` returns the whole trigger group, so `read_single` depends on them.
+  The time stamps are the host clock at INIT plus the meter's buffer stamps
+  (1/1024 s ticks). The call ends within 2 s per reading + 5 s; at 9600 baud
+  the transfer alone is about 56 ms per reading.
