@@ -357,6 +357,38 @@ class ReadBufferTest(unittest.TestCase):
         self.assertTrue(np.all(np.diff(stamps) > 0))
 
 
+class HoldTest(unittest.TestCase):
+    def test_a_held_driver_refuses_every_command(self):
+        fake = Fake6485()
+        d = hw_driver(fake)
+        d._held_by = "a Campbell run (will)"
+        for call in (lambda: d.read_single(), lambda: d.read_n(2), lambda: d.read_buffer(5),
+                     lambda: d.set_nplc(1.0), lambda: d.zero_check_on(), lambda: d.reset(),
+                     lambda: d.query("*IDN?")):
+            with self.assertRaisesRegex(RuntimeError, "in use: a Campbell run"):
+                call()
+        self.assertEqual(fake.log, [])
+        d._held_by = None
+        self.assertEqual(d.query("*IDN?"), IDN)
+
+    def test_simulation_reads_are_refused_too(self):
+        d = K6485Driver(mode="simulation")
+        d.connect()
+        d._held_by = "x"
+        with self.assertRaises(RuntimeError):
+            d.read_single()
+
+    def test_disconnect_while_held_closes_without_touching_the_input(self):
+        fake = Fake6485()
+        d = hw_driver(fake)
+        d._mode = "hardware"
+        d._held_by = "x"
+        d.disconnect()
+        self.assertTrue(fake.closed)
+        self.assertNotIn("SYST:ZCH ON", fake.log)
+        self.assertFalse(d.is_connected)
+
+
 class ConnectTest(unittest.TestCase):
     def _connect(self, fake):
         rm = mock.Mock()
