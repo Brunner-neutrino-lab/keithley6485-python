@@ -224,6 +224,7 @@ from keithley6485 import K6485Driver
 
 with K6485Driver(visa="ASRL/dev/ttyUSB0::INSTR", mode="hardware",
                  baud_rate=9600, read_termination="\r", write_termination="\r") as drv:
+    drv.reset()                                    # connect() sends no *RST
     drv.zero_check_off()
     drv.set_range(20e-9)
     drv.set_nplc(1.0)
@@ -231,7 +232,18 @@ with K6485Driver(visa="ASRL/dev/ttyUSB0::INSTR", mode="hardware",
     currents, timestamps = drv.read_n(10, delay_s=0.05)
 ```
 
-Its `connect()` sends `*RST`. Its `read_buffer()` assumes one value per reading
-in `TRAC:DATA?` and makes up its time stamps, so use the Campbell program for
-buffered data. Simulation: `K6485Driver(mode="simulation")`. NiceGUI panel:
+- 8 current ranges: 2 nA – 20 mA
+- Interface: RS-232 (serial) or GPIB via pyvisa
+- Zero check must be OFF before measuring (`drv.zero_check_off()`)
+- `connect()` checks `*IDN?` and sends no `*RST`; call `reset()` for factory
+  defaults.
+- `read_buffer(n)` (n up to 2500) sets `FORM:ELEM READ,TIME,STAT`, arm count 1
+  and trigger count n, waits on `*OPC?`, reads `TRAC:DATA?` (three fields per
+  reading) and puts the trigger and arm counts and `FORM:ELEM` back as found:
+  `READ?` returns the whole trigger group, so `read_single` depends on them.
+  The time stamps are the host clock at INIT plus the meter's buffer stamps
+  (1/1024 s ticks). The call ends within 2 s per reading + 5 s; at 9600 baud
+  the transfer alone is about 56 ms per reading.
+
+Simulation: `K6485Driver(mode="simulation")`. NiceGUI panel:
 `python -m keithley6485.gui`.
